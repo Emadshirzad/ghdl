@@ -1,1 +1,1 @@
-download mongo2
+download mhrr
