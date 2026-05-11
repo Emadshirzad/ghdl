@@ -1,0 +1,79 @@
+name: Cleanup old dl/ branches
+
+on:
+  schedule:
+    - cron: '0 3 * * 1'   # every Monday at 03:00 UTC
+  workflow_dispatch:
+    inputs:
+      max_age_days:
+        description: 'Delete dl/ branches older than this many days'
+        required: false
+        type: number
+        default: 14
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Delete dl/ branches older than 14 days
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          MAX_AGE_DAYS: ${{ github.event.inputs.max_age_days || 14 }}
+        run: |
+          set -euo pipefail
+
+          CUTOFF=$(date -u -d "${MAX_AGE_DAYS} days ago" +%s)
+          echo "🗓️  Deleting dl/ branches with last commit older than ${MAX_AGE_DAYS} days"
+          echo "   Cutoff: $(date -u -d @${CUTOFF} +%Y-%m-%dT%H:%M:%SZ)"
+
+          DELETED=0
+          KEPT=0
+          PAGE=1
+
+          while true; do
+            # Fetch up to 100 branches per page that start with dl/
+            BRANCHES=$(gh api \
+              "repos/${REPO}/branches?per_page=100&page=${PAGE}" \
+              --jq '[.[] | select(.name | startswith("dl/")) | .name]')
+
+            COUNT=$(echo "$BRANCHES" | python3 -c "import json,sys; print(len(json.load(sys.stdin)))")
+            [ "$COUNT" -eq 0 ] && break
+
+            while IFS= read -r BRANCH; do
+              [ -z "$BRANCH" ] && continue
+
+              # Get the date of the branch's latest commit
+              COMMIT_DATE=$(gh api "repos/${REPO}/commits/${BRANCH}" \
+                --jq '.commit.committer.date' 2>/dev/null || echo "")
+
+              if [ -z "$COMMIT_DATE" ]; then
+                echo "⚠️  Could not fetch commit date for $BRANCH — skipping"
+                continue
+              fi
+
+              COMMIT_TS=$(date -u -d "$COMMIT_DATE" +%s)
+
+              if [ "$COMMIT_TS" -lt "$CUTOFF" ]; then
+                echo "🗑️  Deleting: $BRANCH (last commit: $COMMIT_DATE)"
+                gh api --method DELETE "repos/${REPO}/git/refs/heads/${BRANCH}" && DELETED=$((DELETED + 1)) || \
+                  echo "   ⚠️  Failed to delete $BRANCH"
+              else
+                echo "✅ Keeping:  $BRANCH (last commit: $COMMIT_DATE)"
+                KEPT=$((KEPT + 1))
+              fi
+            done < <(echo "$BRANCHES" | python3 -c "import json,sys; [print(b) for b in json.load(sys.stdin)]")
+
+            PAGE=$((PAGE + 1))
+          done
+
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🗑️  Deleted: $DELETED branch(es)"
+          echo "✅ Kept:    $KEPT branch(es)"

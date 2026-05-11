@@ -1,0 +1,373 @@
+name: YouTube Downloader
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: 'YouTube URL (video or playlist)'
+        required: true
+        type: string
+      output_format:
+        description: 'Output format'
+        required: true
+        type: choice
+        options:
+          - 'mp4 (video)'
+          - 'mp3 (audio only)'
+          - 'best (auto)'
+        default: 'mp4 (video)'
+      video_quality:
+        description: 'Max video resolution'
+        required: false
+        type: choice
+        options:
+          - '2160 (4K)'
+          - '1080 (Full HD)'
+          - '720 (HD)'
+          - '480'
+          - '360'
+          - '144'
+          - 'best'
+        default: '1080 (Full HD)'
+      audio_quality:
+        description: 'Audio bitrate — MP3 only'
+        required: false
+        type: choice
+        options:
+          - '320'
+          - '192'
+          - '128'
+          - '64'
+        default: '192'
+      video_codec:
+        description: 'Preferred video codec'
+        required: false
+        type: choice
+        options:
+          - 'any (auto)'
+          - 'h264 (MP4 compatible)'
+          - 'vp9'
+          - 'av1'
+        default: 'any (auto)'
+      concurrent_fragments:
+        description: 'Parallel download fragments'
+        required: false
+        type: choice
+        options:
+          - '4'
+          - '8'
+          - '16'
+          - '1'
+        default: '4'
+      sponsorblock:
+        description: 'Skip sponsor/intro/outro via SponsorBlock'
+        required: false
+        type: boolean
+        default: false
+      embed_chapters:
+        description: 'Embed chapter markers'
+        required: false
+        type: boolean
+        default: true
+      embed_metadata:
+        description: 'Embed thumbnail and metadata'
+        required: false
+        type: boolean
+        default: true
+      download_subtitles:
+        description: 'Download subtitle files'
+        required: false
+        type: boolean
+        default: false
+      subtitle_langs:
+        description: 'Subtitle languages, comma-separated (e.g. en,fa)'
+        required: false
+        type: string
+        default: 'en'
+      playlist_items:
+        description: |
+          Playlist items: empty = single video, all = full playlist,
+          3-7 = range, 1,3,5 = specific items
+        required: false
+        type: string
+      trim_start:
+        description: 'Trim start timestamp (e.g. 0:33 or 1:22:10)'
+        required: false
+        type: string
+      trim_end:
+        description: 'Trim end timestamp (e.g. 1:22 or 2:00:00)'
+        required: false
+        type: string
+      write_description:
+        description: 'Save video description as .description file'
+        required: false
+        type: boolean
+        default: false
+      cookies:
+        description: |
+          Cookie string (Netscape format) for geo/age-restricted videos.
+          Alternative: store as repo secret YT_COOKIES — used automatically.
+        required: false
+        type: string
+      max_part_mb:
+        description: 'Max part size in MB for splitting (0 = no split)'
+        required: false
+        type: number
+        default: 90
+      extra_args:
+        description: 'Extra yt-dlp arguments (advanced users)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install tools
+        run: |
+          sudo apt-get install -y ffmpeg p7zip-full
+          pip install -q -U "yt-dlp[default]" bgutil-ytdlp-pot-provider
+          git clone --depth 1 --branch 1.3.1 \
+            https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git \
+            /tmp/bgutil
+          cd /tmp/bgutil/server && npm ci && npx tsc
+
+      - name: Start PO Token provider
+        run: |
+          node /tmp/bgutil/server/build/main.js &
+          sleep 5
+
+      - name: Download media
+        run: |
+          set -euo pipefail
+
+          URL="${{ github.event.inputs.video_url }}"
+          FORMAT_INPUT="${{ github.event.inputs.output_format }}"
+          VIDEO_QUALITY="${{ github.event.inputs.video_quality }}"
+          AUDIO_Q="${{ github.event.inputs.audio_quality }}"
+          CODEC="${{ github.event.inputs.video_codec }}"
+          FRAGMENTS="${{ github.event.inputs.concurrent_fragments }}"
+          TRIM_START="${{ github.event.inputs.trim_start }}"
+          TRIM_END="${{ github.event.inputs.trim_end }}"
+          PLAYLIST_ITEMS="${{ github.event.inputs.playlist_items }}"
+          SUBTITLES="${{ github.event.inputs.download_subtitles }}"
+          SUB_LANGS="${{ github.event.inputs.subtitle_langs }}"
+          EMBED_META="${{ github.event.inputs.embed_metadata }}"
+          EMBED_CHAPTERS="${{ github.event.inputs.embed_chapters }}"
+          SPONSORBLOCK="${{ github.event.inputs.sponsorblock }}"
+          WRITE_DESC="${{ github.event.inputs.write_description }}"
+          EXTRA_ARGS="${{ github.event.inputs.extra_args }}"
+          THRESH_MB="${{ github.event.inputs.max_part_mb }}"
+
+          TIMESTAMP=$(date +%Y-%m-%d_%H-%M-%S)
+          OUTDIR="/tmp/ytdl/$TIMESTAMP"
+          WORKDIR="/tmp/ytdl_work"
+          mkdir -p "$OUTDIR" "$WORKDIR/yt"
+
+          SPLIT_LIMIT=$(( ${THRESH_MB:-90} * 1024 * 1024 ))
+
+          split_or_copy() {
+            local src="$1" dst_dir="$2" size base
+            size=$(stat -c%s "$src")
+            base=$(basename "$src")
+            if [ "${THRESH_MB:-90}" -gt 0 ] && [ "$size" -gt "$SPLIT_LIMIT" ]; then
+              echo "✂️  $base is $(( size / 1024 / 1024 )) MB — splitting into ${THRESH_MB}MB parts"
+              7za a -v${THRESH_MB}m "$dst_dir/${base}.7z" "$src"
+            else
+              cp "$src" "$dst_dir/$base"
+            fi
+          }
+
+          # Cookie handling: prefer inline input, fallback to YT_COOKIES secret
+          COOKIE_ARGS=""
+          if [ -n "${INPUT_COOKIES:-}" ]; then
+            printf '%s' "$INPUT_COOKIES" > /tmp/cookies.txt
+            COOKIE_ARGS="--cookies /tmp/cookies.txt"
+          elif [ -n "${SECRET_YT_COOKIES:-}" ]; then
+            printf '%s' "$SECRET_YT_COOKIES" > /tmp/cookies.txt
+            COOKIE_ARGS="--cookies /tmp/cookies.txt"
+          fi
+
+          QUALITY_NUM=$(echo "$VIDEO_QUALITY" | grep -o '[0-9]*' | head -1)
+
+          case "$CODEC" in
+            "h264 (MP4 compatible)") CODEC_FILTER="[vcodec^=avc]"; MERGE_FMT="mp4" ;;
+            "vp9")                   CODEC_FILTER="[vcodec^=vp9]"; MERGE_FMT="mkv" ;;
+            "av1")                   CODEC_FILTER="[vcodec^=av01]"; MERGE_FMT="mkv" ;;
+            *)                       CODEC_FILTER=""; MERGE_FMT="mp4" ;;
+          esac
+
+          if [ "$FORMAT_INPUT" = "mp3 (audio only)" ]; then
+            FORMAT_ARGS="-x --audio-format mp3 --audio-quality ${AUDIO_Q}K"
+          elif [ "$FORMAT_INPUT" = "best (auto)" ] || [ "$VIDEO_QUALITY" = "best" ]; then
+            FORMAT_ARGS="-f bestvideo+bestaudio --merge-output-format mp4"
+          else
+            if [ -n "$CODEC_FILTER" ]; then
+              FORMAT_ARGS="-f bestvideo[height<=${QUALITY_NUM}]${CODEC_FILTER}+bestaudio/bestvideo[height<=${QUALITY_NUM}]+bestaudio/best[height<=${QUALITY_NUM}] --merge-output-format ${MERGE_FMT}"
+            else
+              FORMAT_ARGS="-f bestvideo[height<=${QUALITY_NUM}]+bestaudio/best[height<=${QUALITY_NUM}] --merge-output-format mp4"
+            fi
+          fi
+
+          SECTION_ARGS=""
+          if [ -n "$TRIM_START" ] && [ -n "$TRIM_END" ]; then
+            SECTION_ARGS="--download-sections *${TRIM_START}-${TRIM_END} --force-keyframes-at-cuts"
+          elif [ -n "$TRIM_START" ]; then
+            SECTION_ARGS="--download-sections *${TRIM_START}-inf --force-keyframes-at-cuts"
+          elif [ -n "$TRIM_END" ]; then
+            SECTION_ARGS="--download-sections *0-${TRIM_END} --force-keyframes-at-cuts"
+          fi
+
+          PLAYLIST_ARGS="--no-playlist"
+          if [ -n "$PLAYLIST_ITEMS" ]; then
+            [ "$PLAYLIST_ITEMS" = "all" ] && PLAYLIST_ARGS="" || PLAYLIST_ARGS="--playlist-items $PLAYLIST_ITEMS"
+          fi
+
+          SUBTITLE_ARGS=""
+          [ "$SUBTITLES" = "true" ] && SUBTITLE_ARGS="--write-subs --write-auto-subs --sub-langs ${SUB_LANGS}"
+
+          META_ARGS=""
+          [ "$EMBED_META" = "true" ] && META_ARGS="--embed-thumbnail --embed-metadata --add-metadata"
+
+          CHAPTER_ARGS=""
+          [ "$EMBED_CHAPTERS" = "true" ] && CHAPTER_ARGS="--embed-chapters"
+
+          SPONSOR_ARGS=""
+          [ "$SPONSORBLOCK" = "true" ] && SPONSOR_ARGS="--sponsorblock-remove sponsor,intro,outro,selfpromo,interaction"
+
+          DESC_ARGS=""
+          [ "$WRITE_DESC" = "true" ] && DESC_ARGS="--write-description"
+
+          yt-dlp \
+            --js-runtimes node \
+            --newline \
+            --extractor-args "youtube:player_client=web_music,web,tv" \
+            --concurrent-fragments "${FRAGMENTS}" \
+            $FORMAT_ARGS \
+            $SECTION_ARGS \
+            $SUBTITLE_ARGS \
+            $META_ARGS \
+            $CHAPTER_ARGS \
+            $SPONSOR_ARGS \
+            $DESC_ARGS \
+            $PLAYLIST_ARGS \
+            $COOKIE_ARGS \
+            -o "$WORKDIR/yt/%(title)s [%(id)s].%(ext)s" \
+            ${EXTRA_ARGS:-} \
+            "$URL"
+
+          for F in "$WORKDIR/yt"/*; do
+            [ -f "$F" ] || continue
+            split_or_copy "$F" "$OUTDIR"
+          done
+
+          (cd "$OUTDIR" && find . -maxdepth 1 -type f | sort | sed 's|^\./||' | xargs sha256sum > sha256sums.txt)
+
+          FILE_COUNT=$(find "$OUTDIR" -type f ! -name sha256sums.txt | wc -l)
+          if [ "$FILE_COUNT" -eq 0 ]; then
+            echo "⚠️  No files downloaded."
+            echo "has_files=false" >> $GITHUB_ENV
+          else
+            echo "✅ Downloaded $FILE_COUNT file(s):"
+            ls -lh "$OUTDIR"
+            echo "has_files=true" >> $GITHUB_ENV
+          fi
+
+          echo "TIMESTAMP=$TIMESTAMP" >> $GITHUB_ENV
+          echo "OUTDIR=$OUTDIR"       >> $GITHUB_ENV
+        env:
+          INPUT_COOKIES: ${{ github.event.inputs.cookies }}
+          SECRET_YT_COOKIES: ${{ secrets.YT_COOKIES }}
+
+      - name: Push to timestamped branch(es)
+        if: env.has_files == 'true'
+        run: |
+          git config user.name  "github-actions"
+          git config user.email "github-actions@github.com"
+
+          FILES_PER_BRANCH=15
+          REPO="${{ github.repository }}"
+          ORIG_BRANCH="${{ github.ref_name }}"
+
+          mapfile -t ALL_FILES < <(find "$OUTDIR" -maxdepth 1 -type f \
+            ! -name sha256sums.txt ! -name README.md | sort)
+          TOTAL_FILES=${#ALL_FILES[@]}
+          TOTAL_BRANCHES=$(( (TOTAL_FILES + FILES_PER_BRANCH - 1) / FILES_PER_BRANCH ))
+          [ "$TOTAL_BRANCHES" -eq 0 ] && TOTAL_BRANCHES=1
+          echo "📊 $TOTAL_FILES file(s) → $TOTAL_BRANCHES branch(es)"
+
+          for PART in $(seq 1 "$TOTAL_BRANCHES"); do
+            START=$(( (PART - 1) * FILES_PER_BRANCH ))
+            CHUNK_FILES=("${ALL_FILES[@]:$START:$FILES_PER_BRANCH}")
+
+            if [ "$TOTAL_BRANCHES" -eq 1 ]; then
+              DL_BRANCH="dl/$TIMESTAMP"
+            else
+              DL_BRANCH="dl/${TIMESTAMP}-part${PART}of${TOTAL_BRANCHES}"
+            fi
+            BASE_URL="https://raw.githubusercontent.com/${REPO}/${DL_BRANCH}"
+
+            CHUNK_DIR="/tmp/chunk_${PART}"
+            mkdir -p "$CHUNK_DIR"
+            for f in "${CHUNK_FILES[@]}"; do cp "$f" "$CHUNK_DIR/"; done
+
+            (cd "$CHUNK_DIR" && find . -maxdepth 1 -type f ! -name sha256sums.txt \
+              | sort | sed 's|^\./||' | xargs sha256sum > sha256sums.txt)
+
+            {
+              echo "## 📦 YouTube Download — \`$TIMESTAMP\`"
+              [ "$TOTAL_BRANCHES" -gt 1 ] && echo "" && echo "**Part $PART of $TOTAL_BRANCHES**"
+              echo ""
+              echo "Branch: \`${DL_BRANCH}\`"
+              echo "URL: \`${{ github.event.inputs.video_url }}\`"
+              echo ""
+              for f in "${CHUNK_FILES[@]}"; do
+                fname=$(basename "$f")
+                echo "- [${fname}](${BASE_URL}/${fname})"
+              done
+              echo ""
+              echo "### Links"
+              echo "\`\`\`"
+              for f in "${CHUNK_FILES[@]}"; do echo "${BASE_URL}/$(basename "$f")"; done
+              echo "\`\`\`"
+              echo ""
+              echo "**Checksums:** \`${BASE_URL}/sha256sums.txt\`"
+            } > "$CHUNK_DIR/README.md"
+
+            git checkout --orphan "$DL_BRANCH"
+            git rm -rf . --quiet 2>/dev/null || true
+            git clean -fd --quiet 2>/dev/null || true
+            cp -r "$CHUNK_DIR/." .
+
+            {
+              echo "source_branch: $ORIG_BRANCH"
+              echo "trigger_workflow: youtube"
+              echo "video_url: ${{ github.event.inputs.video_url }}"
+              echo "format: ${{ github.event.inputs.output_format }}"
+              echo "quality: ${{ github.event.inputs.video_quality }}"
+              [ "$TOTAL_BRANCHES" -gt 1 ] && echo "part: $PART of $TOTAL_BRANCHES"
+              echo "files:"
+              find . -maxdepth 1 -type f \
+                ! -name manifest.yml ! -name sha256sums.txt ! -name README.md \
+                | sort | sed 's|^\./||;s/^/  - /'
+            } > manifest.yml
+
+            git add .
+            git commit -m "📦 YouTube $TIMESTAMP$([ "$TOTAL_BRANCHES" -gt 1 ] && echo " part $PART/$TOTAL_BRANCHES") [skip ci]"
+            git push origin "$DL_BRANCH"
+            echo "✅ Part $PART/$TOTAL_BRANCHES → $DL_BRANCH"
+
+            [ "$PART" -lt "$TOTAL_BRANCHES" ] && git checkout "$ORIG_BRANCH"
+          done
