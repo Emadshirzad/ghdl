@@ -28,6 +28,9 @@ git commit -am "docker://ubuntu:22.04"
 # Build an AUR package
 git commit -am "aur://yay"
 
+# Download from mega.nz
+git commit -am "https://mega.nz/file/XXXXXXXX#YYYYYYYY"
+
 # Download a YouTube / media URL via yt-dlp
 git commit -am "https://youtu.be/dQw4w9WgXcQ"
 
@@ -45,6 +48,7 @@ You can also trigger it from the GitHub web UI: edit any file, write the URL as 
 |---|---|---|
 | `docker://image:tag` | `docker save \| gzip` | `docker_image__tag.tar.gz` |
 | `aur://package-name` | `makepkg -s` inside `archlinux:latest` | `package-version.pkg.tar.zst` |
+| `mega.nz` file or folder URL | `megadl` | original filename(s) |
 | Known video site / media extension | `yt-dlp` | `Title.mp4` |
 | Any other `http(s)://` URL | `aria2c` (16 connections) | original filename |
 

@@ -43,6 +43,11 @@ jobs:
           else
             echo "has_media=false" >> $GITHUB_OUTPUT
           fi
+          if echo "$MSG" | grep -qiP 'mega\.nz/(file|folder|#!)'; then
+            echo "has_mega=true"  >> $GITHUB_OUTPUT
+          else
+            echo "has_mega=false" >> $GITHUB_OUTPUT
+          fi
           echo "YT_PO_FLAG=" >> $GITHUB_ENV
           echo "Commit message: $MSG"
 
@@ -52,6 +57,11 @@ jobs:
         run: |
           sudo apt-get install -y aria2 p7zip-full
           pip install -q yt-dlp
+
+      - name: Install megatools
+        if: steps.detect.outputs.has_targets == 'true' && steps.detect.outputs.has_mega == 'true'
+        run: |
+          sudo apt-get install -y megatools
 
       - name: Generate YouTube PO token via Deno
         if: steps.detect.outputs.has_targets == 'true' && steps.detect.outputs.has_media == 'true'
@@ -111,6 +121,11 @@ jobs:
             echo "$1" | grep -qiP '(youtube\.com|youtu\.be|vimeo\.com|dailymotion\.com|twitch\.tv|tiktok\.com|instagram\.com|facebook\.com|fb\.watch|twitter\.com|x\.com|reddit\.com|bilibili\.com|vk\.com|vkvideo\.ru|rutube\.ru|streamable\.com|odysee\.com|rumble\.com|kick\.com|ok\.ru|weibo\.com|douyin\.com|afreecatv\.com|\.(mp4|mkv|webm|flv|avi|mov|m3u8)(\?|$))'
           }
 
+          # Returns 0 if the URL is a mega.nz file or folder link
+          is_mega_url() {
+            echo "$1" | grep -qiP 'mega\.nz/(file|folder|#!)'
+          }
+
           # ── Docker images (docker://image:tag) ───────────────────────────────
           while IFS= read -r DOCKER_URL; do
             IMAGE="${DOCKER_URL#docker://}"
@@ -166,7 +181,21 @@ jobs:
             [ -z "$URL" ] && continue
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-            if is_media_url "$URL"; then
+            if is_mega_url "$URL"; then
+              # ── mega.nz via megadl ───────────────────────────────────────────
+              echo "☁️  megadl: $URL"
+              MEGADIR="$WORKDIR/mega"
+              mkdir -p "$MEGADIR"
+              megadl --path "$MEGADIR" "$URL" \
+                || { echo "⚠️  megadl failed for $URL — skipping"; continue; }
+
+              find "$MEGADIR" -type f | sort | while IFS= read -r F; do
+                split_or_copy "$F" "$OUTDIR"
+                rm -f "$F"
+              done
+              rm -rf "$MEGADIR"
+
+            elif is_media_url "$URL"; then
               # ── Media / video via yt-dlp ─────────────────────────────────────
               echo "🎬 yt-dlp: $URL"
               YTDIR="$WORKDIR/yt"

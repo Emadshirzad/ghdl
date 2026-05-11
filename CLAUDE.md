@@ -45,6 +45,9 @@ git commit -am "docker://ubuntu:22.04"
 # AUR package (builds inside archlinux:latest container, outputs .pkg.tar.zst)
 git commit -am "aur://yay"
 
+# MEGA file/folder download
+git commit -am "https://mega.nz/file/XXXXXXXX#YYYYYYYY"
+
 # YouTube / media
 git commit -am "https://youtu.be/dQw4w9WgXcQ"
 
