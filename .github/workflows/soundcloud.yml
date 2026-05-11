@@ -1,0 +1,192 @@
+name: SoundCloud Downloader
+
+on:
+  workflow_dispatch:
+    inputs:
+      media_url:
+        description: 'SoundCloud URL (track, playlist, or artist)'
+        required: true
+        type: string
+      output_format:
+        description: 'Output format'
+        required: true
+        type: choice
+        options:
+          - mp3
+          - flac
+        default: mp3
+      audio_quality:
+        description: 'Audio quality'
+        required: true
+        type: choice
+        options:
+          - '320k'
+          - '192k'
+          - '128k'
+        default: '320k'
+      max_part_mb:
+        description: 'Max part size in MB for splitting (0 = no split)'
+        required: false
+        type: number
+        default: 90
+
+permissions:
+  contents: write
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install tools
+        run: |
+          sudo apt-get install -y ffmpeg p7zip-full
+          pip install -q -U yt-dlp
+
+      - name: Download from SoundCloud
+        run: |
+          set -euo pipefail
+
+          URL="${{ github.event.inputs.media_url }}"
+          FORMAT="${{ github.event.inputs.output_format }}"
+          QUALITY="${{ github.event.inputs.audio_quality }}"
+          THRESH_MB="${{ github.event.inputs.max_part_mb }}"
+
+          TIMESTAMP=$(date +%Y-%m-%d_%H-%M-%S)
+          OUTDIR="/tmp/sc_out/$TIMESTAMP"
+          WORKDIR="/tmp/sc_work"
+          mkdir -p "$OUTDIR" "$WORKDIR"
+
+          SPLIT_LIMIT=$(( ${THRESH_MB:-90} * 1024 * 1024 ))
+
+          split_or_copy() {
+            local src="$1" dst_dir="$2" size base
+            size=$(stat -c%s "$src")
+            base=$(basename "$src")
+            if [ "${THRESH_MB:-90}" -gt 0 ] && [ "$size" -gt "$SPLIT_LIMIT" ]; then
+              echo "✂️  $base is $(( size / 1024 / 1024 )) MB — splitting into ${THRESH_MB}MB parts"
+              7za a -v${THRESH_MB}m "$dst_dir/${base}.7z" "$src"
+            else
+              cp "$src" "$dst_dir/$base"
+            fi
+          }
+
+          echo "🎵 Downloading: $URL"
+          yt-dlp \
+            -x \
+            --audio-format "$FORMAT" \
+            --audio-quality "$QUALITY" \
+            --embed-thumbnail \
+            --embed-metadata \
+            --newline \
+            -o "$WORKDIR/%(uploader)s - %(title)s [%(id)s].%(ext)s" \
+            "$URL"
+
+          for F in "$WORKDIR"/*; do
+            [ -f "$F" ] || continue
+            split_or_copy "$F" "$OUTDIR"
+          done
+
+          (cd "$OUTDIR" && find . -maxdepth 1 -type f | sort | sed 's|^\./||' | xargs sha256sum > sha256sums.txt)
+
+          FILE_COUNT=$(find "$OUTDIR" -type f ! -name sha256sums.txt | wc -l)
+          if [ "$FILE_COUNT" -eq 0 ]; then
+            echo "⚠️  No files downloaded."
+            echo "has_files=false" >> $GITHUB_ENV
+          else
+            echo "✅ Downloaded $FILE_COUNT file(s):"
+            ls -lh "$OUTDIR"
+            echo "has_files=true" >> $GITHUB_ENV
+          fi
+
+          echo "TIMESTAMP=$TIMESTAMP" >> $GITHUB_ENV
+          echo "OUTDIR=$OUTDIR"       >> $GITHUB_ENV
+
+      - name: Push to timestamped branch(es)
+        if: env.has_files == 'true'
+        run: |
+          git config user.name  "github-actions"
+          git config user.email "github-actions@github.com"
+
+          FILES_PER_BRANCH=15
+          REPO="${{ github.repository }}"
+          ORIG_BRANCH="${{ github.ref_name }}"
+
+          mapfile -t ALL_FILES < <(find "$OUTDIR" -maxdepth 1 -type f \
+            ! -name sha256sums.txt ! -name README.md | sort)
+          TOTAL_FILES=${#ALL_FILES[@]}
+          TOTAL_BRANCHES=$(( (TOTAL_FILES + FILES_PER_BRANCH - 1) / FILES_PER_BRANCH ))
+          [ "$TOTAL_BRANCHES" -eq 0 ] && TOTAL_BRANCHES=1
+          echo "📊 $TOTAL_FILES file(s) → $TOTAL_BRANCHES branch(es)"
+
+          for PART in $(seq 1 "$TOTAL_BRANCHES"); do
+            START=$(( (PART - 1) * FILES_PER_BRANCH ))
+            CHUNK_FILES=("${ALL_FILES[@]:$START:$FILES_PER_BRANCH}")
+
+            if [ "$TOTAL_BRANCHES" -eq 1 ]; then
+              DL_BRANCH="dl/$TIMESTAMP"
+            else
+              DL_BRANCH="dl/${TIMESTAMP}-part${PART}of${TOTAL_BRANCHES}"
+            fi
+            BASE_URL="https://raw.githubusercontent.com/${REPO}/${DL_BRANCH}"
+
+            CHUNK_DIR="/tmp/chunk_${PART}"
+            mkdir -p "$CHUNK_DIR"
+            for f in "${CHUNK_FILES[@]}"; do cp "$f" "$CHUNK_DIR/"; done
+
+            (cd "$CHUNK_DIR" && find . -maxdepth 1 -type f ! -name sha256sums.txt \
+              | sort | sed 's|^\./||' | xargs sha256sum > sha256sums.txt)
+
+            {
+              echo "## 🎵 SoundCloud Download — \`$TIMESTAMP\`"
+              [ "$TOTAL_BRANCHES" -gt 1 ] && echo "" && echo "**Part $PART of $TOTAL_BRANCHES**"
+              echo ""
+              echo "Branch: \`${DL_BRANCH}\`"
+              echo "URL: \`${{ github.event.inputs.media_url }}\`"
+              echo ""
+              for f in "${CHUNK_FILES[@]}"; do
+                fname=$(basename "$f")
+                echo "- [${fname}](${BASE_URL}/${fname})"
+              done
+              echo ""
+              echo "### Links"
+              echo "\`\`\`"
+              for f in "${CHUNK_FILES[@]}"; do echo "${BASE_URL}/$(basename "$f")"; done
+              echo "\`\`\`"
+              echo ""
+              echo "**Checksums:** \`${BASE_URL}/sha256sums.txt\`"
+            } > "$CHUNK_DIR/README.md"
+
+            git checkout --orphan "$DL_BRANCH"
+            git rm -rf . --quiet 2>/dev/null || true
+            git clean -fd --quiet 2>/dev/null || true
+            cp -r "$CHUNK_DIR/." .
+
+            {
+              echo "source_branch: $ORIG_BRANCH"
+              echo "trigger_workflow: soundcloud"
+              echo "media_url: ${{ github.event.inputs.media_url }}"
+              echo "format: ${{ github.event.inputs.output_format }}"
+              echo "quality: ${{ github.event.inputs.audio_quality }}"
+              [ "$TOTAL_BRANCHES" -gt 1 ] && echo "part: $PART of $TOTAL_BRANCHES"
+              echo "files:"
+              find . -maxdepth 1 -type f \
+                ! -name manifest.yml ! -name sha256sums.txt ! -name README.md \
+                | sort | sed 's|^\./||;s/^/  - /'
+            } > manifest.yml
+
+            git add .
+            git commit -m "🎵 SoundCloud $TIMESTAMP$([ "$TOTAL_BRANCHES" -gt 1 ] && echo " part $PART/$TOTAL_BRANCHES") [skip ci]"
+            git push origin "$DL_BRANCH"
+            echo "✅ Part $PART/$TOTAL_BRANCHES → $DL_BRANCH"
+
+            [ "$PART" -lt "$TOTAL_BRANCHES" ] && git checkout "$ORIG_BRANCH"
+          done

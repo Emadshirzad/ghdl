@@ -1,21 +1,30 @@
 name: ghdl
 
-# Trigger: commit message containing docker://, aur://, or http(s):// URLs
+# Trigger options:
+#   1. Push a commit whose message contains http(s):// URLs
+#   2. Actions → ghdl → Run workflow → paste URLs into the "urls" field
 # Examples:
 #   git commit -am "https://example.com/file.zip"
-#   git commit -am "docker://ubuntu:22.04"
-#   git commit -am "aur://yay"
 #   git commit -am "https://youtu.be/dQw4w9WgXcQ"
-#   git commit -am "docker://nginx:latest aur://paru https://example.com/data.tar"
+#   git commit -am "https://mega.nz/file/XXXXXXXX#YYYYYYYY"
+# For Docker images use the "Docker Image Downloader" workflow.
+# For AUR packages use the "AUR Package Builder" workflow.
+# For YouTube use the "YouTube Downloader" workflow.
 
 on:
   push:
     branches: ["**"]
+  workflow_dispatch:
+    inputs:
+      urls:
+        description: 'Space-separated https:// URLs to download'
+        required: true
+        type: string
 
 jobs:
   download:
-    # Skip commits we generated ourselves
-    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+    # Skip commits we generated ourselves; always run on workflow_dispatch
+    if: github.event_name == 'workflow_dispatch' || !contains(github.event.head_commit.message, '[skip ci]')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -28,12 +37,16 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      # ── 2. Detect whether this commit contains any download targets ──────────
+      # ── 2. Detect whether this trigger contains any download targets ─────────
       - name: Detect targets
         id: detect
         run: |
-          MSG=$(git log -1 --pretty=%B)
-          if echo "$MSG" | grep -qP '(docker://|aur://|https?://)'; then
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            MSG="${{ github.event.inputs.urls }}"
+          else
+            MSG=$(git log -1 --pretty=%B)
+          fi
+          if echo "$MSG" | grep -qP 'https?://'; then
             echo "has_targets=true"  >> $GITHUB_OUTPUT
           else
             echo "has_targets=false" >> $GITHUB_OUTPUT
@@ -49,7 +62,7 @@ jobs:
             echo "has_mega=false" >> $GITHUB_OUTPUT
           fi
           echo "YT_PO_FLAG=" >> $GITHUB_ENV
-          echo "Commit message: $MSG"
+          echo "URLs: $MSG"
 
       # ── 3. Install tools ─────────────────────────────────────────────────────
       - name: Install tools
@@ -91,7 +104,12 @@ jobs:
         run: |
           set -euo pipefail
 
-          MSG=$(git log -1 --pretty=%B)
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            MSG="${{ github.event.inputs.urls }}"
+          else
+            MSG=$(git log -1 --pretty=%B)
+          fi
+
           TIMESTAMP=$(date +%Y-%m-%d_%H-%M-%S)
           OUTDIR="/tmp/ghdl/$TIMESTAMP"
           WORKDIR="/tmp/ghdl_work"
@@ -125,54 +143,6 @@ jobs:
           is_mega_url() {
             echo "$1" | grep -qiP 'mega\.nz/(file|folder|#!)'
           }
-
-          # ── Docker images (docker://image:tag) ───────────────────────────────
-          while IFS= read -r DOCKER_URL; do
-            IMAGE="${DOCKER_URL#docker://}"
-            [ -z "$IMAGE" ] && continue
-            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            echo "🐳 Docker pull: $IMAGE"
-            docker pull "$IMAGE"
-
-            SAFE=$(echo "$IMAGE" | tr '/:.' '___')
-            TARFILE="$WORKDIR/docker_${SAFE}.tar.gz"
-            echo "💾 Saving image as tar.gz …"
-            docker save "$IMAGE" | gzip > "$TARFILE"
-            echo "   Raw size: $(( $(stat -c%s "$TARFILE") / 1024 / 1024 )) MB"
-
-            split_or_copy "$TARFILE" "$OUTDIR"
-            rm -f "$TARFILE"
-          done < <(echo "$MSG" | grep -oP 'docker://\S+' || true)
-
-          # ── AUR packages (aur://package-name) ────────────────────────────────
-          while IFS= read -r AUR_REF; do
-            PKGNAME="${AUR_REF#aur://}"
-            [ -z "$PKGNAME" ] && continue
-            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            echo "🏗️  AUR build: $PKGNAME"
-            AURDIR="$WORKDIR/aur_${PKGNAME}"
-            mkdir -p "$AURDIR"
-
-            docker run --rm \
-              -v "$AURDIR:/pkg" \
-              archlinux:latest \
-              bash -c "
-                set -e
-                pacman -Sy --noconfirm archlinux-keyring
-                pacman -Su --noconfirm --needed base-devel git sudo
-                useradd -m builder
-                echo 'builder ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers
-                chmod -R 777 /pkg
-                su - builder -c 'git clone https://aur.archlinux.org/${PKGNAME}.git /tmp/pkg && cd /tmp/pkg && makepkg -s --noconfirm && cp *.pkg.tar.* /pkg/'
-              " || { echo "⚠️  AUR build failed for $PKGNAME — skipping"; continue; }
-
-            for F in "$AURDIR"/*.pkg.tar.*; do
-              [ -f "$F" ] || continue
-              split_or_copy "$F" "$OUTDIR"
-              rm -f "$F"
-            done
-            rm -rf "$AURDIR"
-          done < <(echo "$MSG" | grep -oP 'aur://\S+' || true)
 
           # ── HTTP/HTTPS URLs ──────────────────────────────────────────────────
           while IFS= read -r RAW_URL; do
@@ -267,70 +237,93 @@ jobs:
       #    Pull a specific download with:
       #      git pull https://github.com/USER/REPO dl/YYYY-MM-DD_HH-MM-SS
       # ── 5. Push downloaded files to a dedicated timestamped branch ─────────
-      - name: Push to timestamped branch
+      - name: Push to timestamped branch(es)
         if: steps.detect.outputs.has_targets == 'true' && env.has_files == 'true'
         run: |
           git config user.name  "github-actions"
           git config user.email "github-actions@github.com"
 
-          DL_BRANCH="dl/$TIMESTAMP"
+          FILES_PER_BRANCH=15
           REPO="${{ github.repository }}"
-          BASE_URL="https://raw.githubusercontent.com/${REPO}/${DL_BRANCH}"
+          ORIG_BRANCH="${{ github.ref_name }}"
 
-          # ── Build README.md ───────────────────────────────────────────────────
-          {
-            echo "## 📦 Download links — \`$TIMESTAMP\`"
-            echo ""
-            echo "Branch: \`${DL_BRANCH}\`  "
-            echo "Triggered by commit: \`${{ github.sha }}\`"
-            echo ""
-            find "$OUTDIR" -maxdepth 1 -type f \
-              ! -name sha256sums.txt \
-              ! -name README.md \
-              | sort \
-              | while IFS= read -r fpath; do
-                  fname=$(basename "$fpath")
-                  echo "- [${fname}](${BASE_URL}/${fname})"
-                done
-            echo ""
-            echo "### Links"
-            echo "\`\`\`"
-            find "$OUTDIR" -maxdepth 1 -type f \
-              ! -name sha256sums.txt \
-              ! -name README.md \
-              | sort \
-              | while IFS= read -r fpath; do
-                  fname=$(basename "$fpath")
-                  echo "${BASE_URL}/${fname}"
-                done
-            echo "\`\`\`"
-            echo ""
-            echo "**Checksums:** \`${BASE_URL}/sha256sums.txt\`"
-            echo ""
-            echo "---"
-          } > "$OUTDIR/README.md"
+          mapfile -t ALL_FILES < <(find "$OUTDIR" -maxdepth 1 -type f \
+            ! -name sha256sums.txt ! -name README.md | sort)
+          TOTAL_FILES=${#ALL_FILES[@]}
+          TOTAL_BRANCHES=$(( (TOTAL_FILES + FILES_PER_BRANCH - 1) / FILES_PER_BRANCH ))
+          [ "$TOTAL_BRANCHES" -eq 0 ] && TOTAL_BRANCHES=1
+          echo "📊 $TOTAL_FILES file(s) → $TOTAL_BRANCHES branch(es)"
 
-          # ── Create orphan dl branch ───────────────────────────────────────────
-          git checkout --orphan "$DL_BRANCH"
-          git rm -rf . --quiet 2>/dev/null || true
-          git clean -fd --quiet 2>/dev/null || true
+          for PART in $(seq 1 "$TOTAL_BRANCHES"); do
+            START=$(( (PART - 1) * FILES_PER_BRANCH ))
+            CHUNK_FILES=("${ALL_FILES[@]:$START:$FILES_PER_BRANCH}")
 
-          cp -r "$OUTDIR/." .
+            if [ "$TOTAL_BRANCHES" -eq 1 ]; then
+              DL_BRANCH="dl/$TIMESTAMP"
+            else
+              DL_BRANCH="dl/${TIMESTAMP}-part${PART}of${TOTAL_BRANCHES}"
+            fi
+            BASE_URL="https://raw.githubusercontent.com/${REPO}/${DL_BRANCH}"
 
-          {
-            echo "source_branch: ${{ github.ref_name }}"
-            echo "trigger_commit: ${{ github.sha }}"
-            echo "commit_message: |"
-            git log -1 --pretty=%B "${{ github.sha }}" | sed 's/^/  /'
-            echo "files:"
-            find . -maxdepth 1 -type f \
-              ! -name manifest.yml ! -name sha256sums.txt ! -name README.md \
-              | sort | sed 's|^\./||;s/^/  - /'
-          } > manifest.yml
+            CHUNK_DIR="/tmp/chunk_${PART}"
+            mkdir -p "$CHUNK_DIR"
+            for f in "${CHUNK_FILES[@]}"; do cp "$f" "$CHUNK_DIR/"; done
 
-          git add .
-          git commit -m "📦 $TIMESTAMP — ${{ github.ref_name }} [skip ci]"
-          git push origin "$DL_BRANCH"
+            (cd "$CHUNK_DIR" && find . -maxdepth 1 -type f ! -name sha256sums.txt \
+              | sort | sed 's|^\./||' | xargs sha256sum > sha256sums.txt)
 
-          echo "✅ Saved to branch: $DL_BRANCH"
-          echo "   Pull with: git pull https://github.com/${{ github.repository }} $DL_BRANCH"
+            {
+              echo "## 📦 Download links — \`$TIMESTAMP\`"
+              [ "$TOTAL_BRANCHES" -gt 1 ] && echo "" && echo "**Part $PART of $TOTAL_BRANCHES**"
+              echo ""
+              echo "Branch: \`${DL_BRANCH}\`"
+              if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+                echo "URLs: \`${{ github.event.inputs.urls }}\`"
+              else
+                echo "Triggered by commit: \`${{ github.sha }}\`"
+              fi
+              echo ""
+              for f in "${CHUNK_FILES[@]}"; do
+                fname=$(basename "$f")
+                echo "- [${fname}](${BASE_URL}/${fname})"
+              done
+              echo ""
+              echo "### Links"
+              echo "\`\`\`"
+              for f in "${CHUNK_FILES[@]}"; do
+                echo "${BASE_URL}/$(basename "$f")"
+              done
+              echo "\`\`\`"
+              echo ""
+              echo "**Checksums:** \`${BASE_URL}/sha256sums.txt\`"
+            } > "$CHUNK_DIR/README.md"
+
+            git checkout --orphan "$DL_BRANCH"
+            git rm -rf . --quiet 2>/dev/null || true
+            git clean -fd --quiet 2>/dev/null || true
+            cp -r "$CHUNK_DIR/." .
+
+            {
+              echo "source_branch: $ORIG_BRANCH"
+              if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+                echo "trigger: workflow_dispatch"
+                echo "urls: ${{ github.event.inputs.urls }}"
+              else
+                echo "trigger_commit: ${{ github.sha }}"
+                echo "commit_message: |"
+                git log -1 --pretty=%B "${{ github.sha }}" | sed 's/^/  /'
+              fi
+              [ "$TOTAL_BRANCHES" -gt 1 ] && echo "part: $PART of $TOTAL_BRANCHES"
+              echo "files:"
+              find . -maxdepth 1 -type f \
+                ! -name manifest.yml ! -name sha256sums.txt ! -name README.md \
+                | sort | sed 's|^\./||;s/^/  - /'
+            } > manifest.yml
+
+            git add .
+            git commit -m "📦 $TIMESTAMP$([ "$TOTAL_BRANCHES" -gt 1 ] && echo " part $PART/$TOTAL_BRANCHES") — $ORIG_BRANCH [skip ci]"
+            git push origin "$DL_BRANCH"
+            echo "✅ Part $PART/$TOTAL_BRANCHES → $DL_BRANCH"
+
+            [ "$PART" -lt "$TOTAL_BRANCHES" ] && git checkout "$ORIG_BRANCH"
+          done
