@@ -186,8 +186,17 @@ jobs:
               echo "☁️  megadl: $URL"
               MEGADIR="$WORKDIR/mega"
               mkdir -p "$MEGADIR"
-              megadl --path "$MEGADIR" "$URL" \
-                || { echo "⚠️  megadl failed for $URL — skipping"; continue; }
+              MEGA_OK=false
+              for _attempt in 1 2 3; do
+                if megadl --path "$MEGADIR" "$URL"; then
+                  MEGA_OK=true; break
+                fi
+                echo "⏳  megadl attempt $_attempt failed — retrying in 30s"
+                sleep 30
+              done
+              if [ "$MEGA_OK" != "true" ]; then
+                echo "⚠️  megadl failed for $URL — skipping"; continue
+              fi
 
               find "$MEGADIR" -type f | sort | while IFS= read -r F; do
                 split_or_copy "$F" "$OUTDIR"
