@@ -1,0 +1,1 @@
+66da26e9e00a9c46e9e0d00bc3d1f12d403cbf0e196492b2e7160392a993c8cc  mhrv-rs-windows-amd64.zip
