@@ -37,7 +37,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -155,7 +155,7 @@ jobs:
 
             {
               echo "## 📦 Google Play — \`${{ github.event.inputs.package_name }}\` (\`${{ github.event.inputs.architecture }}\`)"
-              [ "$TOTAL_BRANCHES" -gt 1 ] && echo "" && echo "**Part $PART of $TOTAL_BRANCHES**"
+              if [ "$TOTAL_BRANCHES" -gt 1 ]; then echo ""; echo "**Part $PART of $TOTAL_BRANCHES**"; fi
               echo ""
               echo "Branch: \`${DL_BRANCH}\`"
               echo ""
@@ -183,7 +183,7 @@ jobs:
               echo "package_name: ${{ github.event.inputs.package_name }}"
               echo "architecture: ${{ github.event.inputs.architecture }}"
               echo "merge_splits: ${{ github.event.inputs.merge_splits }}"
-              [ "$TOTAL_BRANCHES" -gt 1 ] && echo "part: $PART of $TOTAL_BRANCHES"
+              [ "$TOTAL_BRANCHES" -gt 1 ] && echo "part: $PART of $TOTAL_BRANCHES" || true
               echo "files:"
               find . -maxdepth 1 -type f \
                 ! -name manifest.yml ! -name sha256sums.txt ! -name README.md \
@@ -195,5 +195,5 @@ jobs:
             git push origin "$DL_BRANCH"
             echo "✅ Part $PART/$TOTAL_BRANCHES → $DL_BRANCH"
 
-            [ "$PART" -lt "$TOTAL_BRANCHES" ] && git checkout "$ORIG_BRANCH"
+            [ "$PART" -lt "$TOTAL_BRANCHES" ] && git checkout "$ORIG_BRANCH" || true
           done
