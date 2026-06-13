@@ -1,0 +1,7 @@
+source_branch: master
+trigger_commit: 9679adc1da77ae77d60d0088cb2270ce0aa2059c
+commit_message: |
+  Merge branch 'master' of https://github.com/Emadshirzad/ghdl
+  
+files:
+  - ghdl
