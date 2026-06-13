@@ -29,7 +29,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -305,7 +305,7 @@ jobs:
 
             {
               echo "## 📨 Telegram Download — \`$TIMESTAMP\`"
-              [ "$TOTAL_BRANCHES" -gt 1 ] && echo "" && echo "**Part $PART of $TOTAL_BRANCHES**"
+              if [ "$TOTAL_BRANCHES" -gt 1 ]; then echo ""; echo "**Part $PART of $TOTAL_BRANCHES**"; fi
               echo ""
               echo "Branch: \`${DL_BRANCH}\`"
               echo ""
@@ -332,7 +332,7 @@ jobs:
               echo "trigger_workflow: telegram"
               echo "links: |"
               printf '%s\n' "${{ github.event.inputs.telegram_links }}" | sed 's/^/  /'
-              [ "$TOTAL_BRANCHES" -gt 1 ] && echo "part: $PART of $TOTAL_BRANCHES"
+              [ "$TOTAL_BRANCHES" -gt 1 ] && echo "part: $PART of $TOTAL_BRANCHES" || true
               echo "files:"
               find . -maxdepth 1 -type f \
                 ! -name manifest.yml ! -name sha256sums.txt ! -name README.md \
@@ -344,5 +344,5 @@ jobs:
             git push origin "$DL_BRANCH"
             echo "✅ Part $PART/$TOTAL_BRANCHES → $DL_BRANCH"
 
-            [ "$PART" -lt "$TOTAL_BRANCHES" ] && git checkout "$ORIG_BRANCH"
+            [ "$PART" -lt "$TOTAL_BRANCHES" ] && git checkout "$ORIG_BRANCH" || true
           done

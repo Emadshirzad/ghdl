@@ -32,7 +32,7 @@ jobs:
     steps:
       # ── 1. Checkout with full history so we can push to other branches ──────
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -61,42 +61,31 @@ jobs:
           else
             echo "has_mega=false" >> $GITHUB_OUTPUT
           fi
-          echo "YT_PO_FLAG=" >> $GITHUB_ENV
           echo "URLs: $MSG"
 
       # ── 3. Install tools ─────────────────────────────────────────────────────
       - name: Install tools
         if: steps.detect.outputs.has_targets == 'true'
         run: |
-          sudo apt-get install -y aria2 p7zip-full
-          pip install -q yt-dlp
+          sudo apt-get install -y aria2 p7zip-full ffmpeg
+          pip install -q -U "yt-dlp[default]"
 
       - name: Install megatools
         if: steps.detect.outputs.has_targets == 'true' && steps.detect.outputs.has_mega == 'true'
         run: |
           sudo apt-get install -y megatools
 
-      - name: Generate YouTube PO token via Deno
+      - name: Start bgutil PO token server
         if: steps.detect.outputs.has_targets == 'true' && steps.detect.outputs.has_media == 'true'
         run: |
-          # Solves YouTube's BotGuard JS challenge automatically — no cookies or secrets needed.
-          # Uses: https://github.com/YunzheZJU/youtube-po-token-generator
-          curl -fsSL https://deno.land/install.sh | sh -s -- --no-modify-path
-          export PATH="$HOME/.deno/bin:$PATH"
-
-          PO_JSON=$(deno run -A npm:youtube-po-token-generator 2>/dev/null || echo "{}")
-          VISITOR_DATA=$(echo "$PO_JSON" | python3 -c \
-            "import sys,json; d=json.load(sys.stdin); print(d.get('visitorData',''))" 2>/dev/null || true)
-          PO_TOKEN=$(echo "$PO_JSON" | python3 -c \
-            "import sys,json; d=json.load(sys.stdin); print(d.get('poToken',''))" 2>/dev/null || true)
-
-          if [ -n "$VISITOR_DATA" ] && [ -n "$PO_TOKEN" ]; then
-            echo "YT_PO_FLAG=--extractor-args youtube:visitor_data=${VISITOR_DATA};po_token=web+${PO_TOKEN}" >> $GITHUB_ENV
-            echo "✅ PO token generated"
-          else
-            echo "YT_PO_FLAG=" >> $GITHUB_ENV
-            echo "⚠️  PO token generation failed — yt-dlp will try without it"
-          fi
+          pip install -q bgutil-ytdlp-pot-provider
+          git clone --depth 1 --branch 1.3.1 \
+            https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git \
+            /tmp/bgutil
+          cd /tmp/bgutil/server && npm ci && npx tsc
+          node /tmp/bgutil/server/build/main.js &
+          sleep 5
+          echo "✅ bgutil PO token server started"
 
       # ── 4. Download everything ───────────────────────────────────────────────
       - name: Download
@@ -180,10 +169,11 @@ jobs:
               YTDIR="$WORKDIR/yt"
               mkdir -p "$YTDIR"
               yt-dlp \
-                -f "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480][ext=mp4]/best[height<=480]" \
+                --js-runtimes node \
+                --extractor-args "youtube:player_client=web_music,web,tv" \
+                -f "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]" \
                 --merge-output-format mp4 \
                 --no-playlist \
-                $YT_PO_FLAG \
                 -o "$YTDIR/%(title)s.%(ext)s" \
                 "$URL" || { echo "⚠️  yt-dlp failed for $URL — skipping"; continue; }
 
@@ -274,7 +264,7 @@ jobs:
 
             {
               echo "## 📦 Download links — \`$TIMESTAMP\`"
-              [ "$TOTAL_BRANCHES" -gt 1 ] && echo "" && echo "**Part $PART of $TOTAL_BRANCHES**"
+              if [ "$TOTAL_BRANCHES" -gt 1 ]; then echo ""; echo "**Part $PART of $TOTAL_BRANCHES**"; fi
               echo ""
               echo "Branch: \`${DL_BRANCH}\`"
               if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
@@ -313,7 +303,7 @@ jobs:
                 echo "commit_message: |"
                 git log -1 --pretty=%B "${{ github.sha }}" | sed 's/^/  /'
               fi
-              [ "$TOTAL_BRANCHES" -gt 1 ] && echo "part: $PART of $TOTAL_BRANCHES"
+              [ "$TOTAL_BRANCHES" -gt 1 ] && echo "part: $PART of $TOTAL_BRANCHES" || true
               echo "files:"
               find . -maxdepth 1 -type f \
                 ! -name manifest.yml ! -name sha256sums.txt ! -name README.md \
@@ -325,5 +315,5 @@ jobs:
             git push origin "$DL_BRANCH"
             echo "✅ Part $PART/$TOTAL_BRANCHES → $DL_BRANCH"
 
-            [ "$PART" -lt "$TOTAL_BRANCHES" ] && git checkout "$ORIG_BRANCH"
+            [ "$PART" -lt "$TOTAL_BRANCHES" ] && git checkout "$ORIG_BRANCH" || true
           done
